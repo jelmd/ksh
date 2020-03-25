@@ -19,11 +19,11 @@ PATH=${PATH}:${PWD}/arch/`bin/package`/bin
 bin/package make ksh \
     SHELL=/bin/bash CC=cc CCFLAGS="-xc99 -D_XPG6 -m64" LDFLAGS="-m64"
 # we need a little helper script stored in this repo
-git clone https://github.com/jelmd/ksh-ast.git
+wget https://raw.githubusercontent.com/ksh-community/ksh/master/etc/mk-ksh-archives.sh
 # create INIT.2012-08-01.txz and ast-ksh.2012-08-01.tgz
-ksh-ast/etc/mk-ksh-archives.sh ${PWD}
+./mk-ksh-archives.sh ${PWD}
 
-mkdir ../ksh-ast && cd ../ksh-ast
+mkdir ../ksh.2012-08-01 && cd ../ksh.2012-08-01
 xz -dc ../ast/INIT.2012-08-01.txz | tar xvf -
 
 # the clean way:
