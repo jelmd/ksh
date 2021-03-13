@@ -18,11 +18,8 @@
 *                                                                      *
 ***********************************************************************/
 #pragma prototyped
-/*
- * David Korn
- * AT&T Labs
- *
- */
+/* David Korn, AT&T Labs */
+/* Copyright (c) 2020, Jens Elkner. All rights reserved. */
 
 #include	"defs.h"
 #include	<fcin.h>
@@ -50,6 +47,33 @@
 #define RW_ALL	(S_IRUSR|S_IRGRP|S_IROTH|S_IWUSR|S_IWGRP|S_IWOTH)
 #define LIBCMD	"cmd"
 
+/* path_xargs stuff */
+#define KSH_COUNT_LEN(vsum, vlen, max, str)	\
+	vlen = strlen(str); \
+	vsum += vlen; \
+	if (vlen > max) max = vlen;
+
+#ifdef __linux__
+    /* need MAX_ARG_STRLEN if kernel got compiled with CONFIG_MMU=y */
+#include <sys/procfs.h>		/* need PAGE_SIZE for: */
+#include <linux/binfmts.h>
+#ifdef MAX_ARG_STRLEN
+#define KSH_CHECK_ARGLEN(vlen) \
+	if (vlen >= MAX_ARG_STRLEN) { \
+		errno = E2BIG; \
+		return (-1); \
+	};
+#endif
+#else
+#define KSH_CHECK_ARGLEN(vlen)
+#endif
+
+#if defined(__FreeBSD__)
+#define ARG_STK_PTR_SZ 0
+#else
+#define ARG_STK_PTR_SZ  (sizeof(char *))
+#endif
+/* END OF path_xargs stuff */
 
 static int		canexecute(Shell_t*,char*,int);
 static void		funload(Shell_t*,int,const char*);
@@ -144,86 +168,231 @@ static pid_t _spawnveg(Shell_t *shp,const char *path, char* const argv[], char* 
 	return(pid);
 }
 
+/* avoid cluttering path_xargs too much */
+#if DEBUG
+#define SHOW_RANGE(x,y,z) \
+	sfprintf(sfstderr, "\nsaveargs=%p  %ld "x" %ld  exitval=%d spawn=%d\n" \
+		"used=%ld/%ld  left=%ld  remaining_args2proc=%ld\n"y" with arg[", \
+		saveargs, av - argv, avlast - argv, exitval, spawn, \
+		size - left, size, left, avlast - av); \
+	if (pre_c > 1) { \
+		sfprintf(sfstderr, "0..%d,", shp->xargmin - 1); \
+	} else if (pre_c == 1 ) { \
+		sfprintf(sfstderr, "0,"); \
+	} \
+	sfprintf(sfstderr, "%d..%d", avfirst - argv, av - argv - 1); \
+	if (post_c > 1) { \
+		sfprintf(sfstderr, ",%d..%d", \
+			avlast - argv, avlast - argv + post_c - 1); \
+	} else if (post_c == 1) { \
+		sfprintf(sfstderr, ",%d", avlast - argv); \
+	} \
+	sfprintf(sfstderr, z);
+#else
+#define SHOW_RANGE(x,y,z)
+#endif
+
 /*
- * used with command -x to run the command in multiple passes
- * spawn is non-zero when invoked via spawn
- * the exitval is set to the maximum for each execution
+ * Used with command -x to run the command in multiple passes.
+ * Spawn is non-zero when invoked via spawn.
+ * The exitval is set to the maximum for each execution.
+ * Trigger e.g.:
+ * command -x /bin/true a1 a2 a3 {4..13} a14 {15..150000} ae1 ae2 ae3
  */
-static pid_t path_xargs(Shell_t *shp,const char *path, char *argv[],char *const envp[], int spawn)
+static pid_t path_xargs(Shell_t *shp,const char *path, char *argv[], char *const envp[], int spawn)
 {
-	register char *cp, **av, **xv;
-	char **avlast= &argv[shp->xargmax], **saveargs=0;
+	register char *cp, **av;
+	char **avlast = &argv[shp->xargmax], **avfirst = &argv[shp->xargmin];
+	char **saveargs = 0;
 	char *const *ev;
-	long size, left;
-	int nlast=1,n,exitval=0;
+	long arg_max = shp->gd->lim.arg_max;
+	long size, env_sz = 0, pre_sz = 0, post_sz = 0, max_sz = 0, left, used;
+	int n = 0, exitval = 0, env_c = 0, pre_c = 0, post_c = 0, c = 0;
 	pid_t pid;
-	if(shp->xargmin < 0)
-		return((pid_t)-1);
-	size = shp->gd->lim.arg_max-1024;
-	for(ev=envp; cp= *ev; ev++)
-		size -= strlen(cp)-1;
-	for(av=argv; (cp= *av) && av< &argv[shp->xargmin]; av++)  
-		size -= strlen(cp)-1;
-	for(av=avlast; cp= *av; av++,nlast++)  
-		size -= strlen(cp)-1;
-	av =  &argv[shp->xargmin];
-	if(!spawn)
+
+	if (shp->xargmin < 0) {
+		return ((pid_t) -1);
+	}
+
+	/* environment */
+	for (ev = envp; cp = *ev; ev++, env_c++) {
+		KSH_COUNT_LEN(env_sz, size, max_sz, cp);
+	}
+	KSH_CHECK_ARGLEN(max_sz);
+	max_sz = 0;
+	/* args before the first word that expands to multiple arguments */
+	for (av = argv; (cp = *av) && av < avfirst; av++, pre_c++) {
+		KSH_COUNT_LEN(pre_sz, size, max_sz, cp);
+	}
+	/* args after the last word that expands to multiple arguments */
+	for (av = avlast; cp = *av; av++, post_c++) {
+		KSH_COUNT_LEN(post_sz, size, max_sz, cp);
+	}
+	KSH_CHECK_ARGLEN(max_sz);
+	/* remember terminating \0 and optional str pointer */
+	env_sz += env_c;
+	env_sz += env_c * ARG_STK_PTR_SZ ;
+	pre_sz += pre_c;
+	pre_sz += pre_c * ARG_STK_PTR_SZ ;
+	post_sz += post_c;
+	post_sz += post_c * ARG_STK_PTR_SZ ;
+
+	/* fail early */
+	size = arg_max - env_sz - pre_sz - post_sz - 2048;
+#if defined(__linux__) && defined(MAX_ARG_STRINGS)
+	if (env_sz > MAX_ARG_STRINGS || (shp->xargmax + post_c) > MAX_ARG_STRINGS) {
+		/* too many args */
+		errno = E2BIG;
+		return (-1);
+	}
+	/* linux compares size of allocated pages against ARG_MAX as well =8-( */
+	size = size & (~(PAGE_SIZE-1));	/* round down to page size */
+#endif
+	if (size < 0) {
+		errno = E2BIG;
+		return (-1);
+	}
+	used = 0;
+	for (av = avfirst; av < avlast; av++) {
+		left = strlen(*av);
+		used += left;
+		if (left > max_sz)
+			max_sz = left;
+	}
+#ifndef __FreeBSD__
+	used += (avlast - avfirst) * (ARG_STK_PTR_SZ + 1);
+#endif
+	KSH_CHECK_ARGLEN(max_sz);
+	if (size <= max_sz) {
+		/* there is at least one arg, which does not fit into remaining space */
+		errno = E2BIG;
+		return (-1);
+	}
+
+	/* if now a E2BIG occurs, we should be able to handle it */
+#if DEBUG
+	sfprintf(sfstderr, "path_xargs():\n"
+		"ARG_MAX=%d  xargmin[%d]=%s  xargmax[%d]=%s  ptr_sz = %d\n"
+		"env_c  = %10d  sz = %10ld\n"
+		"pre_c  = %10d  sz = %10ld\n"
+		"post_c = %10d  sz = %10ld\n"
+		"argsum = %10d  sz = %10ld\n"
+		"max. arglen = %ld\n"
+		"consumed space = %ld\nremaining arg space = %ld\n"
+			,
+		shp->gd->lim.arg_max,
+		shp->xargmin, *avfirst, shp->xargmax, *avlast, ARG_STK_PTR_SZ,
+		env_c, env_sz,
+		pre_c, pre_sz,
+		post_c, post_sz,
+		avlast - argv + post_c, used,
+		max_sz, shp->gd->lim.arg_max - size, size
+	);
+#endif /* DEBUG */
+
+	if (!spawn)
 		job_clear();
 	shp->exitval = 0;
-	while(av<avlast)
-	{
-		for(xv=av,left=size; left>0 && av<avlast;)
-			left -= strlen(*av++)+1;
-		/* leave at least two for last */
-		if(left<0 && (avlast-av)<2)
-			av--;
-		if(xv==&argv[shp->xargmin])
-		{
-			n = nlast*sizeof(char*);
-			saveargs = (char**)malloc(n);
-			memcpy((void*)saveargs, (void*)av, n);
-			memcpy((void*)av,(void*)avlast,n);
+	av = avfirst;
+	while (av < avlast) {
+		avfirst = av;
+		for (left = size; left > 0 && av < avlast; ) {
+			left -= strlen(*av++) + 1 + ARG_STK_PTR_SZ ;
 		}
-		else
-		{
-			for(n=shp->xargmin; xv < av; xv++)
+
+		if (left < 0)  {
+			av--;
+			left += strlen(*av) + 1 + ARG_STK_PTR_SZ ;
+		}
+		/* leave at least two for last */
+		if (avlast - av == 1 && (av - avfirst) > 2) {
+			av--;
+			left += strlen(*av) + 1 + ARG_STK_PTR_SZ ;
+		}
+
+		if (avfirst <= &argv[shp->xargmin + post_c]) {
+			/* save last args incl. NULL to pass on each invocation */
+			n = (post_c + 1) * sizeof(char *);
+			saveargs = (char **) malloc(n);
+			memcpy((void *) saveargs, (void *) av, n);
+			memcpy((void *) av, (void *) avlast, n);
+		} else {
+			char **xv = avfirst;
+			for (n = shp->xargmin; xv < av; xv++)
 				argv[n++] = *xv;
-			for(xv=avlast; cp=  *xv; xv++)
+			for (xv = avlast; cp = *xv; xv++)
 				argv[n++] = cp;
 			argv[n] = 0;
 		}
-		if(saveargs || av<avlast || (exitval && !spawn))
-		{
-			if((pid=_spawnveg(shp,path,argv,envp,0)) < 0)
-				return(-1);
-			job_post(shp,pid,0);
+
+		if (saveargs || av < avlast || (exitval && !spawn)) {
+			SHOW_RANGE("<", "Spawning", "]\n");
+			if ((pid = _spawnveg(shp, path, argv, envp, 0)) < 0) {
+				if (errno == E2BIG) {
+					if (avfirst == &argv[shp->xargmin]
+						&& size > (8192 + max_sz))
+					{
+/* On some OS (e.g. Solaris) 32-bit executables have only ARG_MAX/2 of what
+ * 64-bit binaries have, e.g. 1 MiB instead of 2 MiB. So ARG_MAX of this binary
+ * might be != of the one to exec.  Therefore we cut in half what have right
+ * now to approach the real limit fast. When we reach 8 KiB + max_sz
+ * (a "good enough" value), we try harder. */
+						arg_max >>= 1;
+						size = arg_max - env_sz - pre_sz - post_sz - 2048;
+					} else {
+						/* Try harder, since we are either low on space or
+						 * succeeded already (and thus this is probably a
+						 * single special case).
+						 */
+						size -= 256;	/* a "good enough" value */
+					}
+					if (size > max_sz) {
+#if DEBUG
+						sfprintf(sfstderr, "Re-trying with %ld ...\n", size);
+#endif /* DEBUG */
+						if (saveargs) {
+							memcpy((void *) av, saveargs, n);
+							free((void *) saveargs);
+							saveargs = NULL;
+						}
+						av = avfirst;
+						errno = 0;
+						continue;
+					}
+				}
+				if (saveargs)
+					free((void *) saveargs);
+				return (-1);
+			}
+#if DEBUG
+			sfprintf(sfstderr, "Spawned %ld\n", pid);
+#endif /* DEBUG */
+			job_post(shp, pid, 0);
 			job_wait(pid);
-			if(shp->exitval>exitval)
+#if DEBUG
+			sfprintf(sfstderr, "Done (%d).\n", shp->exitval);
+#endif /* DEBUG */
+			if (shp->exitval > exitval)
 				exitval = shp->exitval;
-			if(saveargs)
-			{
-				memcpy((void*)av,saveargs,n);
-				free((void*)saveargs);
+			if (saveargs) {
+				memcpy((void *) av, saveargs, n);
+				free((void *) saveargs);
 				saveargs = 0;
 			}
-		}
-		else if(spawn && !sh_isoption(SH_PFSH))
-		{
+		} else if (spawn && !sh_isoption(SH_PFSH)) {
+			spawn >>= 1;
+			SHOW_RANGE("==", "Last spawn", "]\n");
 			shp->xargexit = exitval;
-			if(saveargs)
-				free((void*)saveargs);
-			return(_spawnveg(shp,path,argv,envp,spawn>>1));
-		}
-		else
-		{
-			if(saveargs)
-				free((void*)saveargs);
-			return(path_pfexecve(shp,path,argv,envp,spawn));
+			return (_spawnveg(shp, path, argv, envp, spawn));
+		} else {
+			SHOW_RANGE("==", "Last pfexec", "]\n");
+			return (path_pfexecve(shp, path, argv, envp, spawn));
 		}
 	}
-	if(!spawn)
+	if (!spawn)
 		exit(exitval);
-	return((pid_t)-1);
+
+	return ((pid_t) -1);
 }
 
 /*
@@ -1237,12 +1406,19 @@ retry:
 #endif /* EMLINK */
 		return(-1);
 	    case E2BIG:
-		if(shp->xargmin)
+		if (shp->xargmin)
 		{
-			pid = path_xargs(shp,opath, &argv[0] ,envp,spawn);
-			if(pid<0)
+			errno = 0;
+			pid = path_xargs(shp, opath, &argv[0], envp, spawn);
+			if (pid < 0) {
+#ifdef DEBUG
+				sfprintf(sfstderr,"path_xargs() faild with errno = %d\n",errno);
+#endif /* DEBUG */
+				if (errno == E2BIG)
+					return (-1);
 				goto retry;
-			return(pid);
+			}
+			return (pid);
 		}
 	    default:
 		errormsg(SH_DICT,ERROR_system(ERROR_NOEXEC),e_exec,path);
